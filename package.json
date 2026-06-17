@@ -1,0 +1,17 @@
+{
+  "name": "real-time-chat",
+  "version": "1.0.0",
+  "description": "Real-time chat with pub/sub backbone",
+  "license": "ISC",
+  "author": "Devansh Jain",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
