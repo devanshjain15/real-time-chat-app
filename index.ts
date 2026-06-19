@@ -11,6 +11,32 @@ function computeAcceptKey(secWebSocketKey: string): string {
   return acceptKey;
 }
 
+function parseFrame(buffer: Buffer): string {
+  let opcode = "";
+  let payloadLength = 0;
+  let maskingKey = Buffer.alloc(4);
+  let payloadData = Buffer.alloc(0);
+  buffer.forEach((byte, i) => {
+    if (i == 0) {
+      opcode = byte.toString(2).padStart(8, "0").slice(4);
+    } else if (i == 1) {
+      payloadLength = parseInt(byte.toString(2).padStart(8, "0").slice(1), 2);
+    } else if (i >= 2 && i < 6) {
+      maskingKey[i - 2] = byte;
+    }
+
+    if (i >= 6 && payloadLength == 0) {
+      return;
+    } else if (i >= 6 && payloadLength > 0) {
+      let maskedByte = byte;
+      let unmaskedByte = maskedByte ^ maskingKey[(i - 6) % 4];
+      payloadData = Buffer.concat([payloadData, Buffer.from([unmaskedByte])]);
+    }
+  });
+
+  return payloadData.toString();
+}
+
 let server = net.createServer((socket) => {
   socket.on("data", (buffer) => {
     let request = buffer.toString();
@@ -30,10 +56,14 @@ let server = net.createServer((socket) => {
     if (upgrade && secWebSocketKey) {
       let acceptKey = computeAcceptKey(secWebSocketKey);
       let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
-      console.log("sending switching protocols response");
+      console.log(`Hanhshake Complete!`);
       socket.write(response);
+      socket.on("data", (buffer: Buffer) => {
+        let payloadData = parseFrame(buffer);
+        console.log(payloadData);
+      });
     } else {
-      // bad request, close the connection
+      // not ws handshake
       socket.end();
     }
   });
