@@ -38,10 +38,12 @@ function parseFrame(buffer: Buffer): string {
 }
 
 let server = net.createServer((socket) => {
-  socket.on("data", (buffer) => {
+  socket.once("data", (buffer: Buffer) => {
+    // http request
     let request = buffer.toString();
     let upgrade = false;
     let secWebSocketKey: string | null = null;
+    // checking for Upgrade to ws header
     for (const line of request.split(/\r?\n/)) {
       let [key, value] = line.split(":");
       if (key && key == "Upgrade" && value && value.trim() == "websocket") {
@@ -54,6 +56,7 @@ let server = net.createServer((socket) => {
     }
 
     if (upgrade && secWebSocketKey) {
+      // sending http response with 101 switching protocol
       let acceptKey = computeAcceptKey(secWebSocketKey);
       let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
       console.log(`Hanhshake Complete!`);
