@@ -1,6 +1,8 @@
 import net from "net";
 import crypto from "crypto";
 
+let clients: Set<net.Socket> = new Set();
+
 function computeAcceptKey(secWebSocketKey: string): string {
   // concatenate the client's key with the magic string
   const magicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -13,14 +15,14 @@ function computeAcceptKey(secWebSocketKey: string): string {
 
 interface Frame {
   opcode: number | null;
-  payloadDataBuf: Buffer;
+  payloadBuffer: Buffer;
 }
 
 function parseFrame(buffer: Buffer): Frame {
   let opcode: number | null = null;
   let payloadLength = 0x0;
   let maskingKey = Buffer.alloc(4);
-  let payloadDataBuf = Buffer.alloc(0);
+  let payloadBuffer = Buffer.alloc(0);
 
   // parsing logic
   buffer.forEach((byte, i) => {
@@ -28,20 +30,20 @@ function parseFrame(buffer: Buffer): Frame {
       opcode = byte & 0x0f;
     } else if (i === 1) {
       payloadLength = byte & 0x7f;
-      payloadDataBuf = Buffer.alloc(payloadLength);
+      payloadBuffer = Buffer.alloc(payloadLength);
     } else if (i >= 2 && i < 6) {
       maskingKey[i - 2] = byte;
     }
     if (i >= 6 && payloadLength === 0x0) {
       return;
     } else if (i >= 6 && payloadLength > 0) {
-      payloadDataBuf[i - 6] = byte ^ maskingKey[(i - 6) % 4];
+      payloadBuffer[i - 6] = byte ^ maskingKey[(i - 6) % 4];
     }
   });
 
   return {
     opcode,
-    payloadDataBuf,
+    payloadBuffer,
   };
 }
 
@@ -69,45 +71,61 @@ let server = net.createServer((socket) => {
       let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
       console.log(`Hanhshake Complete!`);
       socket.write(response);
+      clients.add(socket);
+
       socket.on("data", (buffer: Buffer) => {
-        let { opcode, payloadDataBuf } = parseFrame(buffer);
-        let payloadDataLength = payloadDataBuf.length;
-        if (opcode === 0x8) {
-          // end connection
-          let closeFrame = Buffer.concat([
-            Buffer.from([0x88, payloadDataLength]),
-            payloadDataBuf,
-          ]);
-          socket.write(closeFrame);
-          socket.end();
-          return;
-        } else if (opcode === 0x9) {
-          // send pong frame
+        // parsing recieved frame
+        let { opcode, payloadBuffer } = parseFrame(buffer);
+        let payloadLength = payloadBuffer.length;
+
+        // handling based on different opcode
+        if (!opcode) return;
+        
+        if (opcode == 0x8) { 
           let frame = Buffer.concat([
-            Buffer.from([0x8a, payloadDataLength]),
-            payloadDataBuf,
+            Buffer.from([0x88, payloadLength & 0x7F]),
+            payloadBuffer,
+          ]);
+          socket.write(frame);
+          socket.end();
+          return; 
+        } else if (opcode == 0x9) {
+          let frame = Buffer.concat([
+            Buffer.from([0x8a, payloadLength & 0x7F]),
+            payloadBuffer,
           ]);
           socket.write(frame);
           return;
-        } else if (opcode === 0x01) {
-          // text data
-          console.log(payloadDataBuf.toString());
-        } else if (opcode === 0x02) {
-          // binary data
-          console.log(payloadDataBuf);
-        }
+        } 
+        
+        let frame: Buffer = Buffer.concat([
+          Buffer.from([(0x80 & 0xf0) | (opcode & 0x0f), payloadLength & 0x7F]),
+          payloadBuffer,
+        ]);
+
+        clients.forEach((client) => {
+          if (client !== socket) {
+            client.write(frame);
+          }
+        });
       });
     } else {
       // not ws handshake
-      socket.end();
+      socket.end(() => {
+        if (clients.has(socket)) {
+          clients.delete(socket);
+        }
+      });
     }
   });
 
   socket.on("end", () => {
+    clients.delete(socket);
     console.log("Connection closed!");
   });
 
   socket.on("error", (err) => {
+    clients.delete(socket);
     console.log("Socket error:", err.message);
   });
 });
