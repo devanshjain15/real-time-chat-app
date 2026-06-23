@@ -66,7 +66,7 @@ function buildFrame(opcode: number, payloadBuffer: Buffer): Buffer {
     payloadLength = 126;
     extendedPayloadLength = Buffer.alloc(2);
     extendedPayloadLength.writeUInt16BE(payloadBufferLength, 0); 
-  } else if (payloadLength > 65535) {
+  } else if (payloadBufferLength > 65535) {
     payloadLength = 127;
     extendedPayloadLength = Buffer.alloc(8);
     extendedPayloadLength.writeBigUInt64BE(BigInt(payloadBufferLength), 0); 
