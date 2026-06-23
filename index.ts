@@ -19,32 +19,66 @@ interface Frame {
 }
 
 function parseFrame(buffer: Buffer): Frame {
-  let opcode: number | null = null;
-  let payloadLength = 0x0;
-  let maskingKey = Buffer.alloc(4);
-  let payloadBuffer = Buffer.alloc(0);
-
   // parsing logic
-  buffer.forEach((byte, i) => {
-    if (i === 0) {
-      opcode = byte & 0x0f;
-    } else if (i === 1) {
-      payloadLength = byte & 0x7f;
-      payloadBuffer = Buffer.alloc(payloadLength);
-    } else if (i >= 2 && i < 6) {
-      maskingKey[i - 2] = byte;
+  let offset = 0;
+
+  const byte0 = buffer.readUInt8(offset);
+  const opcode = buffer.readUInt8(offset) & 0x0f;
+  offset += 1;
+
+  const byte1 = buffer.readUInt8(offset);
+  const masked = (byte1 & 0x80) !== 0;
+  let payloadLength = byte1 & 0x7f;
+  offset += 1;
+
+  if (payloadLength === 0x7e) {
+    payloadLength = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (payloadLength === 0x7f) {
+    payloadLength = Number(buffer.readBigUInt64BE(offset));
+    offset += 8;
+  }
+
+  let payloadBuffer = Buffer.alloc(payloadLength);
+  if (masked && payloadLength !== 0x00) {
+    let maskingKey = buffer.subarray(offset, offset + 4);
+    offset += 4;
+    for (let i = 0; i < payloadLength; i++) {
+      let byte = buffer.readUInt8(offset + i);
+      payloadBuffer[i] = byte ^ maskingKey[i % 4];
     }
-    if (i >= 6 && payloadLength === 0x0) {
-      return;
-    } else if (i >= 6 && payloadLength > 0) {
-      payloadBuffer[i - 6] = byte ^ maskingKey[(i - 6) % 4];
-    }
-  });
+  }
 
   return {
     opcode,
     payloadBuffer,
   };
+}
+
+function buildFrame(opcode: number, payloadBuffer: Buffer): Buffer {
+  let byte1 = (0x80 & 0xf0) | (opcode & 0x0f);
+  let payloadBufferLength = payloadBuffer.length;
+  let payloadLength = 0;
+  let extendedPayloadLength = Buffer.alloc(0);
+  if (payloadBufferLength < 126) {
+    payloadLength = payloadBufferLength; 
+  } else if (payloadBufferLength >= 126 && payloadBufferLength <= 65535) {
+    payloadLength = 126;
+    extendedPayloadLength = Buffer.alloc(2);
+    extendedPayloadLength.writeUInt16BE(payloadBufferLength, 0); 
+  } else if (payloadLength > 65535) {
+    payloadLength = 127;
+    extendedPayloadLength = Buffer.alloc(8);
+    extendedPayloadLength.writeBigUInt64BE(BigInt(payloadBufferLength), 0); 
+  }
+
+  let byte2 = payloadLength & 0x7f;
+  
+  return Buffer.concat([
+    Buffer.from([byte1, byte2]), 
+    extendedPayloadLength, 
+    payloadBuffer,
+  ]);
 }
 
 let server = net.createServer((socket) => {
@@ -76,32 +110,20 @@ let server = net.createServer((socket) => {
       socket.on("data", (buffer: Buffer) => {
         // parsing recieved frame
         let { opcode, payloadBuffer } = parseFrame(buffer);
-        let payloadLength = payloadBuffer.length;
 
         // handling based on different opcode
         if (!opcode) return;
-        
-        if (opcode == 0x8) { 
-          let frame = Buffer.concat([
-            Buffer.from([0x88, payloadLength & 0x7F]),
-            payloadBuffer,
-          ]);
-          socket.write(frame);
+
+        if (opcode == 0x8) {
+          socket.write(buildFrame(opcode, payloadBuffer));
           socket.end();
-          return; 
-        } else if (opcode == 0x9) {
-          let frame = Buffer.concat([
-            Buffer.from([0x8a, payloadLength & 0x7F]),
-            payloadBuffer,
-          ]);
-          socket.write(frame);
           return;
-        } 
-        
-        let frame: Buffer = Buffer.concat([
-          Buffer.from([(0x80 & 0xf0) | (opcode & 0x0f), payloadLength & 0x7F]),
-          payloadBuffer,
-        ]);
+        } else if (opcode == 0x9) {
+          socket.write(buildFrame(0xa, payloadBuffer));
+          return;
+        }
+
+        let frame: Buffer = buildFrame(opcode, payloadBuffer);
 
         clients.forEach((client) => {
           if (client !== socket) {
