@@ -1,7 +1,8 @@
 import net from "net";
 import crypto from "crypto";
 
-let clients: Set<net.Socket> = new Set();
+let connections: Set<net.Socket> = new Set();
+let clients: Map<net.Socket, string> = new Map();
 
 function computeAcceptKey(secWebSocketKey: string): string {
   // concatenate the client's key with the magic string
@@ -61,22 +62,22 @@ function buildFrame(opcode: number, payloadBuffer: Buffer): Buffer {
   let payloadLength = 0;
   let extendedPayloadLength = Buffer.alloc(0);
   if (payloadBufferLength < 126) {
-    payloadLength = payloadBufferLength; 
+    payloadLength = payloadBufferLength;
   } else if (payloadBufferLength >= 126 && payloadBufferLength <= 65535) {
     payloadLength = 126;
     extendedPayloadLength = Buffer.alloc(2);
-    extendedPayloadLength.writeUInt16BE(payloadBufferLength, 0); 
+    extendedPayloadLength.writeUInt16BE(payloadBufferLength, 0);
   } else if (payloadBufferLength > 65535) {
     payloadLength = 127;
     extendedPayloadLength = Buffer.alloc(8);
-    extendedPayloadLength.writeBigUInt64BE(BigInt(payloadBufferLength), 0); 
+    extendedPayloadLength.writeBigUInt64BE(BigInt(payloadBufferLength), 0);
   }
 
   let byte2 = payloadLength & 0x7f;
-  
+
   return Buffer.concat([
-    Buffer.from([byte1, byte2]), 
-    extendedPayloadLength, 
+    Buffer.from([byte1, byte2]),
+    extendedPayloadLength,
     payloadBuffer,
   ]);
 }
@@ -103,9 +104,11 @@ let server = net.createServer((socket) => {
       // sending http response with 101 switching protocol
       let acceptKey = computeAcceptKey(secWebSocketKey);
       let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
-      console.log(`Hanhshake Complete!`);
       socket.write(response);
-      clients.add(socket);
+
+      connections.add(socket);
+      let isAuthenticated = false;
+      console.log(`Hanhshake Complete!`);
 
       socket.on("data", (buffer: Buffer) => {
         // parsing recieved frame
@@ -123,35 +126,66 @@ let server = net.createServer((socket) => {
           return;
         }
 
-        let frame: Buffer = buildFrame(opcode, payloadBuffer);
+        let payloadJson = JSON.parse(payloadBuffer.toString());
+        if (!isAuthenticated) {
+          if (payloadJson.type === "message") {
+            // send error frame
+          }
+          if (!clients.has(socket)) {
+            clients.set(socket, payloadJson.username);
+            isAuthenticated = true;
+          } else {
+            // send error frame because already authenicateds
+          }
+          return;
+        }
 
-        clients.forEach((client) => {
-          if (client !== socket) {
-            client.write(frame);
+
+
+        let username = clients.get(socket);
+        if (payloadJson.type !== "message" || !username) return; // this should also return the error frame as this should not be possible
+
+        let frame: Buffer = buildFrame(
+          opcode,
+          Buffer.from(JSON.stringify({ username, text: payloadJson.text })),
+        );
+
+        connections.forEach((conn) => {
+          if (conn !== socket) {
+            conn.write(frame);
           }
         });
       });
     } else {
       // not ws handshake
       socket.end(() => {
-        if (clients.has(socket)) {
-          clients.delete(socket);
+        if (connections.has(socket)) {
+          connections.delete(socket);
+          if (clients.has(socket)) {
+            clients.delete(socket);
+          }
         }
       });
     }
   });
 
   socket.on("end", () => {
-    clients.delete(socket);
+    connections.delete(socket);
+    if (clients.has(socket)) {
+      clients.delete(socket);
+    }
     console.log("Connection closed!");
   });
 
   socket.on("error", (err) => {
-    clients.delete(socket);
+    connections.delete(socket);
+    if (clients.has(socket)) {
+      clients.delete(socket);
+    }
     console.log("Socket error:", err.message);
   });
 });
 
 server.listen(8000, () => {
-  console.log("Server is up at http://localhost:8000");
+  console.log("Server is up at 127.0.0.1:8000");
 });
