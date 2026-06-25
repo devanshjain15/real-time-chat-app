@@ -1,8 +1,15 @@
 import net from "net";
 import crypto from "crypto";
 
-let connections: Set<net.Socket> = new Set();
-let clients: Map<net.Socket, string> = new Map();
+type RoomId = string;
+
+interface Connection {
+  username: string;
+  roomId: RoomId;
+}
+
+let rooms: Map<RoomId, Set<net.Socket>> = new Map();
+let clients: Map<net.Socket, Connection> = new Map();
 
 function computeAcceptKey(secWebSocketKey: string): string {
   // concatenate the client's key with the magic string
@@ -12,6 +19,19 @@ function computeAcceptKey(secWebSocketKey: string): string {
   const acceptKey = crypto.createHash("sha1").update(combined).digest("base64");
 
   return acceptKey;
+}
+
+enum PayloadType {
+  "JOIN",
+  "CHANGE",
+  "MESSAGE",
+}
+
+interface Payload {
+  type: PayloadType;
+  message?: string;
+  username?: string;
+  roomId?: string;
 }
 
 interface Frame {
@@ -82,6 +102,45 @@ function buildFrame(opcode: number, payloadBuffer: Buffer): Buffer {
   ]);
 }
 
+function changeRoom(socket: net.Socket, roomId: RoomId) {
+  if (rooms.get(roomId)?.has(socket) || clients.get(socket)?.roomId === roomId)
+    // already in that room
+    return;
+
+  let connection = clients.get(socket);
+  // checking if client exists or not
+  if (!connection) return;
+
+  removeFromRoom(socket);
+  connection.roomId = roomId;
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
+  }
+  let room = rooms.get(roomId);
+  if (!room) return;
+  room.add(socket);
+
+  sendJoinMessage(socket);
+}
+
+function sendJoinMessage(socket: net.Socket) {
+  let conn = clients.get(socket);
+  if (!conn) return;
+  let frame = buildFrame(0x1, Buffer.from(`${conn.username} joined the chat!`));
+  rooms.get(conn.roomId)?.forEach((client) => {
+    if (client !== socket) client.write(frame);
+  });
+}
+
+function removeFromRoom(socket: net.Socket) {
+  let connection = clients.get(socket);
+  if (!connection) return;
+  rooms.get(connection.roomId)?.delete(socket);
+  if (rooms.get(connection.roomId)?.size === 0) {
+    rooms.delete(connection.roomId);
+  }
+}
+
 let server = net.createServer((socket) => {
   socket.once("data", (buffer: Buffer) => {
     // http request
@@ -106,7 +165,6 @@ let server = net.createServer((socket) => {
       let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
       socket.write(response);
 
-      connections.add(socket);
       let isAuthenticated = false;
       console.log(`Hanhshake Complete!`);
 
@@ -126,60 +184,87 @@ let server = net.createServer((socket) => {
           return;
         }
 
-        let payloadJson = JSON.parse(payloadBuffer.toString());
+        let payloadJson: Payload = JSON.parse(payloadBuffer.toString());
         if (!isAuthenticated) {
-          if (payloadJson.type === "message") {
+          if (
+            payloadJson.type === PayloadType.MESSAGE ||
+            payloadJson.type === PayloadType.CHANGE
+          ) {
             // send error frame
           }
-          if (!clients.has(socket)) {
-            clients.set(socket, payloadJson.username);
+          if (
+            !clients.has(socket) &&
+            payloadJson.username &&
+            payloadJson.roomId
+          ) {
+            let { username, roomId } = payloadJson;
+            if (!rooms.has(roomId)) {
+              rooms.set(roomId, new Set());
+            }
+            rooms.get(roomId)?.add(socket);
+            clients.set(socket, {
+              username,
+              roomId,
+            });
             isAuthenticated = true;
+
+            // send username joined message to every other client in that room!
+            sendJoinMessage(socket);
           } else {
             // send error frame because already authenicateds
           }
           return;
         }
 
+        let username = clients.get(socket)?.username;
+        if (payloadJson.type === PayloadType.JOIN || !username) return; // this should also return the error frame as this should not be possible
 
+        if (payloadJson.type === PayloadType.CHANGE) {
+          changeRoom(socket, payloadJson.roomId as RoomId);
+        } else if (payloadJson.type === PayloadType.MESSAGE) {
+          let frame: Buffer = buildFrame(
+            opcode,
+            Buffer.from(
+              JSON.stringify({ username, message: payloadJson.message }),
+            ),
+          );
+          let roomId = clients.get(socket)?.roomId;
 
-        let username = clients.get(socket);
-        if (payloadJson.type !== "message" || !username) return; // this should also return the error frame as this should not be possible
-
-        let frame: Buffer = buildFrame(
-          opcode,
-          Buffer.from(JSON.stringify({ username, text: payloadJson.text })),
-        );
-
-        connections.forEach((conn) => {
-          if (conn !== socket) {
-            conn.write(frame);
-          }
-        });
+          rooms.get(roomId as RoomId)?.forEach((conn) => {
+            if (conn !== socket) conn.write(frame);
+          });
+        }
       });
     } else {
       // not ws handshake
       socket.end(() => {
-        if (connections.has(socket)) {
-          connections.delete(socket);
-          if (clients.has(socket)) {
-            clients.delete(socket);
+        const connection = clients.get(socket);
+        if (connection) {
+          if (rooms.has(connection.roomId)) {
+            rooms.get(connection.roomId)?.delete(socket);
+            if (rooms.get(connection.roomId)?.size === 0) {
+              rooms.delete(connection.roomId);
+            }
           }
+          clients.delete(socket);
         }
       });
     }
   });
 
   socket.on("end", () => {
-    connections.delete(socket);
-    if (clients.has(socket)) {
+    const connection = clients.get(socket);
+    if (connection) {
+      removeFromRoom(socket);
       clients.delete(socket);
     }
     console.log("Connection closed!");
   });
 
   socket.on("error", (err) => {
-    connections.delete(socket);
-    if (clients.has(socket)) {
+    const connection = clients.get(socket);
+    if (connection) {
+      removeFromRoom(socket);
       clients.delete(socket);
     }
     console.log("Socket error:", err.message);
