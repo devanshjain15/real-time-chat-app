@@ -287,10 +287,9 @@ function removeFromRoom(socket: net.Socket) {
 }
 
 async function ensureRoomSubscribed(roomId: RoomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, new Set());
-  }
+  if (rooms.has(roomId)) return;
 
+  rooms.set(roomId, new Set());
   await subscriber.subscribe(roomId, (message) => {
     let { socketId, frame } = JSON.parse(message);
     rooms.get(roomId)?.forEach((client) => {
