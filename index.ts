@@ -1,24 +1,12 @@
 import net from "net";
 import crypto from "crypto";
+import { createClient } from "redis";
 
 type RoomId = string;
 
 interface Connection {
   username: string;
   roomId: RoomId;
-}
-
-let rooms: Map<RoomId, Set<net.Socket>> = new Map();
-let clients: Map<net.Socket, Connection> = new Map();
-
-function computeAcceptKey(secWebSocketKey: string): string {
-  // concatenate the client's key with the magic string
-  const magicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-  const combined = secWebSocketKey.concat(magicString);
-  // compute the SHA-1 hash of the combined string and encode it in base64
-  const acceptKey = crypto.createHash("sha1").update(combined).digest("base64");
-
-  return acceptKey;
 }
 
 enum PayloadType {
@@ -37,6 +25,161 @@ interface Payload {
 interface Frame {
   opcode: number | null;
   payloadBuffer: Buffer;
+}
+
+let rooms: Map<RoomId, Set<net.Socket>> = new Map();
+let clients: Map<net.Socket, Connection> = new Map();
+
+let publisher = createClient();
+let subscriber = createClient();
+
+async function main() {
+  await publisher.connect();
+  await subscriber.connect();
+
+  let server = net.createServer((socket) => {
+    socket.once("data", (buffer: Buffer) => {
+      // http request
+      let request = buffer.toString();
+      let upgrade = false;
+      let secWebSocketKey: string | null = null;
+      // checking for Upgrade to ws header
+      for (const line of request.split(/\r?\n/)) {
+        let [key, value] = line.split(":");
+        if (key && key == "Upgrade" && value && value.trim() == "websocket") {
+          upgrade = true;
+        }
+
+        if (key == "Sec-WebSocket-Key") {
+          secWebSocketKey = value.trim();
+        }
+      }
+
+      if (upgrade && secWebSocketKey) {
+        // sending http response with 101 switching protocol
+        let acceptKey = computeAcceptKey(secWebSocketKey);
+        let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
+        socket.write(response);
+
+        let isAuthenticated = false;
+        console.log(`Hanhshake Complete!`);
+
+        socket.on("data", async (buffer: Buffer) => {
+          // parsing recieved frame
+          let { opcode, payloadBuffer } = parseFrame(buffer);
+
+          // handling based on different opcode
+          if (!opcode) return;
+
+          if (opcode == 0x8) {
+            socket.write(buildFrame(opcode, payloadBuffer));
+            socket.end();
+            return;
+          } else if (opcode == 0x9) {
+            socket.write(buildFrame(0xa, payloadBuffer));
+            return;
+          }
+
+          let payloadJson: Payload = JSON.parse(payloadBuffer.toString());
+          if (!isAuthenticated) {
+            if (
+              payloadJson.type === PayloadType.MESSAGE ||
+              payloadJson.type === PayloadType.CHANGE
+            ) {
+              // send error frame
+              return;
+            }
+            if (
+              !clients.has(socket) &&
+              payloadJson.username &&
+              payloadJson.roomId
+            ) {
+              let { username, roomId } = payloadJson;
+              ensureRoomSubscribed(roomId);
+              rooms.get(roomId)?.add(socket);
+              clients.set(socket, {
+                username,
+                roomId,
+              });
+              isAuthenticated = true;
+
+              // send username joined message to every other client in that room!
+              sendJoinMessage(socket);
+            } else {
+              // send error frame because already authenicateds
+              return;
+            }
+            return;
+          }
+
+          let conn = clients.get(socket);
+          if (payloadJson.type === PayloadType.JOIN || !conn) return; // this should also return the error frame as this should not be possible
+
+          if (payloadJson.type === PayloadType.CHANGE) {
+            changeRoom(socket, payloadJson.roomId as RoomId);
+          } else if (payloadJson.type === PayloadType.MESSAGE) {
+            let frame: Buffer = buildFrame(
+              opcode,
+              Buffer.from(
+                JSON.stringify({
+                  username: conn.username,
+                  message: payloadJson.message,
+                }),
+              ),
+            );
+            // let roomId = clients.get(socket)?.roomId;
+
+            await publisher.publish(
+              conn.roomId,
+              JSON.stringify({ socketId: "", frame: frame.toString("base64") }),
+            );
+          }
+        });
+      } else {
+        // not ws handshake
+        socket.end(() => {
+          const connection = clients.get(socket);
+          if (connection) {
+            removeFromRoom(socket);
+            clients.delete(socket);
+          }
+        });
+      }
+    });
+
+    socket.on("end", () => {
+      const connection = clients.get(socket);
+      if (connection) {
+        removeFromRoom(socket);
+        clients.delete(socket);
+      }
+      console.log("Connection closed!");
+    });
+
+    socket.on("error", (err) => {
+      const connection = clients.get(socket);
+      if (connection) {
+        removeFromRoom(socket);
+        clients.delete(socket);
+      }
+      console.log("Socket error:", err.message);
+    });
+  });
+
+  const PORT = process.argv[2];
+  server.listen(PORT, () => {
+    console.log(`Server is up at 127.0.0.1:${PORT}`);
+  });
+}
+
+function computeAcceptKey(secWebSocketKey: string): string {
+  // concatenate the client's key with the magic string
+  const magicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  const combined = secWebSocketKey.concat(magicString);
+  // compute the SHA-1 hash of the combined string and encode it in base64
+  const acceptKey = crypto.createHash("sha1").update(combined).digest("base64");
+
+  return acceptKey;
 }
 
 function parseFrame(buffer: Buffer): Frame {
@@ -102,8 +245,11 @@ function buildFrame(opcode: number, payloadBuffer: Buffer): Buffer {
   ]);
 }
 
-function changeRoom(socket: net.Socket, roomId: RoomId) {
-  if (rooms.get(roomId)?.has(socket) || clients.get(socket)?.roomId === roomId)
+function changeRoom(socket: net.Socket, newRoomId: RoomId) {
+  if (
+    rooms.get(newRoomId)?.has(socket) ||
+    clients.get(socket)?.roomId === newRoomId
+  )
     // already in that room
     return;
 
@@ -112,24 +258,23 @@ function changeRoom(socket: net.Socket, roomId: RoomId) {
   if (!connection) return;
 
   removeFromRoom(socket);
-  connection.roomId = roomId;
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, new Set());
-  }
-  let room = rooms.get(roomId);
+  connection.roomId = newRoomId;
+  ensureRoomSubscribed(newRoomId);
+  let room = rooms.get(newRoomId);
   if (!room) return;
   room.add(socket);
 
   sendJoinMessage(socket);
 }
 
-function sendJoinMessage(socket: net.Socket) {
+async function sendJoinMessage(socket: net.Socket) {
   let conn = clients.get(socket);
   if (!conn) return;
   let frame = buildFrame(0x1, Buffer.from(`${conn.username} joined the chat!`));
-  rooms.get(conn.roomId)?.forEach((client) => {
-    if (client !== socket) client.write(frame);
-  });
+  await publisher.publish(
+    conn.roomId,
+    JSON.stringify({ socketId: "", frame: frame.toString("base64") }),
+  );
 }
 
 function removeFromRoom(socket: net.Socket) {
@@ -141,136 +286,17 @@ function removeFromRoom(socket: net.Socket) {
   }
 }
 
-let server = net.createServer((socket) => {
-  socket.once("data", (buffer: Buffer) => {
-    // http request
-    let request = buffer.toString();
-    let upgrade = false;
-    let secWebSocketKey: string | null = null;
-    // checking for Upgrade to ws header
-    for (const line of request.split(/\r?\n/)) {
-      let [key, value] = line.split(":");
-      if (key && key == "Upgrade" && value && value.trim() == "websocket") {
-        upgrade = true;
-      }
+async function ensureRoomSubscribed(roomId: RoomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
+  }
 
-      if (key == "Sec-WebSocket-Key") {
-        secWebSocketKey = value.trim();
-      }
-    }
-
-    if (upgrade && secWebSocketKey) {
-      // sending http response with 101 switching protocol
-      let acceptKey = computeAcceptKey(secWebSocketKey);
-      let response = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`;
-      socket.write(response);
-
-      let isAuthenticated = false;
-      console.log(`Hanhshake Complete!`);
-
-      socket.on("data", (buffer: Buffer) => {
-        // parsing recieved frame
-        let { opcode, payloadBuffer } = parseFrame(buffer);
-
-        // handling based on different opcode
-        if (!opcode) return;
-
-        if (opcode == 0x8) {
-          socket.write(buildFrame(opcode, payloadBuffer));
-          socket.end();
-          return;
-        } else if (opcode == 0x9) {
-          socket.write(buildFrame(0xa, payloadBuffer));
-          return;
-        }
-
-        let payloadJson: Payload = JSON.parse(payloadBuffer.toString());
-        if (!isAuthenticated) {
-          if (
-            payloadJson.type === PayloadType.MESSAGE ||
-            payloadJson.type === PayloadType.CHANGE
-          ) {
-            // send error frame
-          }
-          if (
-            !clients.has(socket) &&
-            payloadJson.username &&
-            payloadJson.roomId
-          ) {
-            let { username, roomId } = payloadJson;
-            if (!rooms.has(roomId)) {
-              rooms.set(roomId, new Set());
-            }
-            rooms.get(roomId)?.add(socket);
-            clients.set(socket, {
-              username,
-              roomId,
-            });
-            isAuthenticated = true;
-
-            // send username joined message to every other client in that room!
-            sendJoinMessage(socket);
-          } else {
-            // send error frame because already authenicateds
-          }
-          return;
-        }
-
-        let username = clients.get(socket)?.username;
-        if (payloadJson.type === PayloadType.JOIN || !username) return; // this should also return the error frame as this should not be possible
-
-        if (payloadJson.type === PayloadType.CHANGE) {
-          changeRoom(socket, payloadJson.roomId as RoomId);
-        } else if (payloadJson.type === PayloadType.MESSAGE) {
-          let frame: Buffer = buildFrame(
-            opcode,
-            Buffer.from(
-              JSON.stringify({ username, message: payloadJson.message }),
-            ),
-          );
-          let roomId = clients.get(socket)?.roomId;
-
-          rooms.get(roomId as RoomId)?.forEach((conn) => {
-            if (conn !== socket) conn.write(frame);
-          });
-        }
-      });
-    } else {
-      // not ws handshake
-      socket.end(() => {
-        const connection = clients.get(socket);
-        if (connection) {
-          if (rooms.has(connection.roomId)) {
-            rooms.get(connection.roomId)?.delete(socket);
-            if (rooms.get(connection.roomId)?.size === 0) {
-              rooms.delete(connection.roomId);
-            }
-          }
-          clients.delete(socket);
-        }
-      });
-    }
+  await subscriber.subscribe(roomId, (message) => {
+    let { socketId, frame } = JSON.parse(message);
+    rooms.get(roomId)?.forEach((client) => {
+      client.write(Buffer.from(frame, "base64"));
+    });
   });
+}
 
-  socket.on("end", () => {
-    const connection = clients.get(socket);
-    if (connection) {
-      removeFromRoom(socket);
-      clients.delete(socket);
-    }
-    console.log("Connection closed!");
-  });
-
-  socket.on("error", (err) => {
-    const connection = clients.get(socket);
-    if (connection) {
-      removeFromRoom(socket);
-      clients.delete(socket);
-    }
-    console.log("Socket error:", err.message);
-  });
-});
-
-server.listen(8000, () => {
-  console.log("Server is up at 127.0.0.1:8000");
-});
+main();
