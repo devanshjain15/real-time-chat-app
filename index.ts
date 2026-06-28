@@ -4,7 +4,8 @@ import { createClient } from "redis";
 
 type RoomId = string;
 
-interface Connection {
+interface Client {
+  clientId: string;
   username: string;
   roomId: RoomId;
 }
@@ -28,7 +29,7 @@ interface Frame {
 }
 
 let rooms: Map<RoomId, Set<net.Socket>> = new Map();
-let clients: Map<net.Socket, Connection> = new Map();
+let clients: Map<net.Socket, Client> = new Map();
 
 let publisher = createClient();
 let subscriber = createClient();
@@ -98,6 +99,7 @@ async function main() {
               ensureRoomSubscribed(roomId);
               rooms.get(roomId)?.add(socket);
               clients.set(socket, {
+                clientId: crypto.randomUUID(),
                 username,
                 roomId,
               });
@@ -131,7 +133,10 @@ async function main() {
 
             await publisher.publish(
               conn.roomId,
-              JSON.stringify({ socketId: "", frame: frame.toString("base64") }),
+              JSON.stringify({
+                socketId: conn.clientId,
+                frame: frame.toString("base64"),
+              }),
             );
           }
         });
@@ -273,16 +278,20 @@ async function sendJoinMessage(socket: net.Socket) {
   let frame = buildFrame(0x1, Buffer.from(`${conn.username} joined the chat!`));
   await publisher.publish(
     conn.roomId,
-    JSON.stringify({ socketId: "", frame: frame.toString("base64") }),
+    JSON.stringify({
+      socketId: conn.clientId,
+      frame: frame.toString("base64"),
+    }),
   );
 }
 
-function removeFromRoom(socket: net.Socket) {
+async function removeFromRoom(socket: net.Socket) {
   let connection = clients.get(socket);
   if (!connection) return;
   rooms.get(connection.roomId)?.delete(socket);
   if (rooms.get(connection.roomId)?.size === 0) {
     rooms.delete(connection.roomId);
+    await subscriber.unsubscribe(connection.roomId);
   }
 }
 
@@ -293,7 +302,8 @@ async function ensureRoomSubscribed(roomId: RoomId) {
   await subscriber.subscribe(roomId, (message) => {
     let { socketId, frame } = JSON.parse(message);
     rooms.get(roomId)?.forEach((client) => {
-      client.write(Buffer.from(frame, "base64"));
+      if (clients.get(client)?.clientId !== socketId)
+        client.write(Buffer.from(frame, "base64"));
     });
   });
 }
