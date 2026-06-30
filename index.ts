@@ -8,6 +8,7 @@ interface Client {
   clientId: string;
   username: string;
   roomId: RoomId;
+  messageTimestamps: number[];
 }
 
 enum PayloadType {
@@ -102,6 +103,7 @@ async function main() {
                 clientId: crypto.randomUUID(),
                 username,
                 roomId,
+                messageTimestamps: [],
               });
               isAuthenticated = true;
 
@@ -120,6 +122,7 @@ async function main() {
           if (payloadJson.type === PayloadType.CHANGE) {
             changeRoom(socket, payloadJson.roomId as RoomId);
           } else if (payloadJson.type === PayloadType.MESSAGE) {
+            if (isRateLimited(conn)) return;
             let frame: Buffer = buildFrame(
               opcode,
               Buffer.from(
@@ -131,6 +134,7 @@ async function main() {
             );
             // let roomId = clients.get(socket)?.roomId;
 
+            conn.messageTimestamps.push(Date.now());
             await publisher.publish(
               conn.roomId,
               JSON.stringify({
@@ -171,10 +175,25 @@ async function main() {
     });
   });
 
-  const PORT = process.argv[2];
+  const PORT = process.argv[2] || 8000;
   server.listen(PORT, () => {
     console.log(`Server is up at 127.0.0.1:${PORT}`);
   });
+}
+
+function isRateLimited(conn: Client): boolean {
+  let now = Date.now();
+  let windowMs = 1000 * 10;
+  let requestLimit = 5;
+
+  // cleaning
+  conn.messageTimestamps = conn.messageTimestamps.filter(
+    (t) => t > now - windowMs,
+  );
+  // checking
+  if (conn.messageTimestamps.length >= requestLimit) return true;
+
+  return false;
 }
 
 function computeAcceptKey(secWebSocketKey: string): string {
